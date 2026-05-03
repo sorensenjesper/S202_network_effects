@@ -6,21 +6,44 @@ import altair as alt
 # --- CONFIGURATION & STATE INITIALIZATION ---
 st.set_page_config(layout="wide", page_title="Luxury Consignment Strategy")
 
+# 1. Global Fund State (Persists across resets)
+if 'round_number' not in st.session_state:
+    st.session_state.round_number = 1
+    st.session_state.cash = 10_000_000  # Staked with $10M total for all experiments
+    st.session_state.starting_cash_this_round = 10_000_000
+
+# 2. Round-Specific State (Resets each experiment)
 if 'history' not in st.session_state:
     st.session_state.history = pd.DataFrame(columns=[
         'Month', 'Buyer_Marketing', 'Seller_Marketing', 'Commission', 'Cash', 
         'Inventory_Count', 'Items_Sold', 'New_Items_Inbound', 'Avg_Days_to_Sell', 'Net_Profit'
     ])
-    # Initial Conditions
-    st.session_state.cash = 2_000_000        # Higher startup capital for inventory ops
-    st.session_state.inventory = 500         # Starting bags/watches
-    st.session_state.active_buyers = 200     # Starting customer base
-    st.session_state.reputation = 100.0      # Starts perfect (Trust Score)
+    st.session_state.inventory = 500         
+    st.session_state.active_buyers = 200     
+    st.session_state.reputation = 100.0      
     st.session_state.month = 0
     st.session_state.game_over = False
     st.session_state.debug_log = {}
+
+# Function to trigger a new experiment
+def start_new_round():
+    st.session_state.round_number += 1
+    st.session_state.starting_cash_this_round = st.session_state.cash
+    
+    # Reset operational variables
+    st.session_state.inventory = 500
+    st.session_state.active_buyers = 200
+    st.session_state.reputation = 100.0
+    st.session_state.month = 0
+    st.session_state.game_over = False
+    st.session_state.history = pd.DataFrame(columns=[
+        'Month', 'Buyer_Marketing', 'Seller_Marketing', 'Commission', 'Cash', 
+        'Inventory_Count', 'Items_Sold', 'New_Items_Inbound', 'Avg_Days_to_Sell', 'Net_Profit'
+    ])
+    st.session_state.debug_log = {}
+
 # --- SIDEBAR: STUDENT DECISIONS ---
-st.sidebar.header("Step 1: Strategic Decisions")
+st.sidebar.header("Strategic Decisions")
 
 # 1. Commission Strategy (The Take Rate)
 st.sidebar.subheader("Monetization")
@@ -35,7 +58,13 @@ auth_spend_per_item = st.sidebar.slider("Authentication Cost per Item ($)", 10, 
 # 3. Marketing (Acquisition)
 st.sidebar.subheader("Monthly Marketing Budget")
 buyer_marketing = st.sidebar.number_input("Buyer Marketing ($)", 0, 200000, 20000, step=5000)
-seller_marketing = st.sidebar.number_input("Consignor Marketing ($)", 0, 200000, 20000, step=5000)
+seller_marketing = st.sidebar.number_input("Seller Marketing ($)", 0, 200000, 20000, step=5000)
+
+# --- SIDEBAR: NEW EXPERIMENT BUTTON ---
+st.sidebar.divider()
+if st.sidebar.button("🔄 Start New Experiment", use_container_width=True):
+    start_new_round()
+    st.rerun()
 
 # --- SIMULATION ENGINE ---
 def run_month():
@@ -45,87 +74,47 @@ def run_month():
     reputation = st.session_state.reputation
     cash = st.session_state.cash
     
-# --- 1. SUPPLY SIDE CALCS (THE AMPLIFIER MODEL) ---
+    # --- 1. SUPPLY SIDE CALCS (THE AMPLIFIER MODEL) ---
     
     # A. The "Organic Engine" (Liquidity & Economics)
-    # -----------------------------------------------
-    # 1. Liquidity Signal:
-    # If items sell in 30 days, sellers are neutral (1.0x). 
-    # If they sell in 10 days, sellers love it (Max 2.0x).
-    # If they sell in 120 days, sellers hate it (Min 0.2x).
     if not st.session_state.history.empty:
         prev_speed = st.session_state.history.iloc[-1]['Avg_Days_to_Sell']
     else:
         prev_speed = 60
 
-    #liquidity_multiplier = np.clip(2.0 - (prev_speed / 60), 0.2, 2.0)
     liquidity_multiplier = np.clip(2.5 - (prev_speed / 30), 0.2, 2.0)
-    # 2. Payout Signal:
-    # If commission is 40%, attractiveness is standard (1.0).
-    # If commission drops to 20%, attractiveness spikes (1.5x).
-    # If commission goes to 60%, attractiveness tanks (0.5x).
     payout_multiplier = max(0.1, 2.0 - (commission_rate / 40))
-    
-    # 3. Base Organic Flow:
-    # This is the "Word of Mouth" factor.
-    # It scales based on current inventory size (larger platforms have more gravity).
     base_organic_flow = 110 + (inventory * 0.05)
     
     # B. The "Marketing Turbocharger"
-    # -----------------------------------------------
-    # Marketing amplifies the organic flow. 
-    # Logic: $0 spend = 1.0x (No boost). $20k spend = ~2.0x (Double the flow).
-    # We use log to prevent infinite linear scaling (diminishing returns).
     marketing_amplifier = 1.0 + np.log1p(seller_marketing / 10000)
     
     # C. Total Inbound Calculation
-    # New items = (Base Demand * Liquidity * Payout) * Marketing Boost
     new_items_inbound = (base_organic_flow * liquidity_multiplier * payout_multiplier) * marketing_amplifier
-    
-    # Cost remains the same (Processing)
     processing_cost = new_items_inbound * auth_spend_per_item
     
-    # --- 2. AUTHENTICATION CALCS ---  Must spend $30 to eliminate fakes.  Above $30 money is wasted.  Too simple? Should be nonlinear and never zero. 
-    fake_probability = max(0, (30 - auth_spend_per_item) / 100)
-    
-    # --- 3. DEMAND SIDE CALCS ---
-    trust_multiplier = reputation / 100
-    variety_multiplier = np.log10(max(1, inventory + 10))
-    
-    # declines in reputation have very strong effects on effectiveness of buyer marketing
-    # multiplier of buyers captures organic attrition when <1
-    new_buyer_traffic = (buyers * 0.95) + (buyer_marketing / 100 * trust_multiplier)
-    
-    # Multiplier changed to 0.15 (was 0.5) - this throttles demand growth by affecting how many buyers purchase. 
-    # So this means in the model what matters is number of buyers, their individual purchase propensities are constant. 
-    # However variety increases the conversion rate as a log function of inventory; greater inventory means any given buyer is more likely to find something.
-    conversion_rate = 0.15
-    demand_volume = new_buyer_traffic * variety_multiplier * conversion_rate
-    sold_items = min(inventory + new_items_inbound, demand_volume)
-    
-    # --- 4. FEEDBACK CALCS ---
-    #fakes_sold = sold_items * fake_probability
-    #reputation_hit = fakes_sold * 2 
-    #new_reputation = max(0, min(100, reputation - reputation_hit + 1))
-
+    # --- 2. AUTHENTICATION CALCS ---
     # A. The Probability Curve (Quadratic)
-    # Logic: Cutting spend a little bit is safer. Cutting a lot is dangerous.
-    # If Spend < $30: Risk starts.
-    # At $25 spend: Risk is ~2.7% (was 5% in linear model)
-    # At $10 spend: Risk is ~44% (Massive danger)
     if auth_spend_per_item < 30:
         fake_probability = ((30 - auth_spend_per_item) / 30) ** 2
     else:
         fake_probability = 0
     
+    # --- 3. DEMAND SIDE CALCS ---
+    trust_multiplier = reputation / 100
+    variety_multiplier = np.log10(max(1, inventory + 10))
+    
+    new_buyer_traffic = (buyers * 0.95) + (buyer_marketing / 100 * trust_multiplier)
+    
+    conversion_rate = 0.15
+    demand_volume = new_buyer_traffic * variety_multiplier * conversion_rate
+    sold_items = min(inventory + new_items_inbound, demand_volume)
+    
+    # --- 4. FEEDBACK CALCS ---
     # B. The Actual Fakes Sold
     fakes_sold = sold_items * fake_probability
 
     # C. The Reputation Hit (Rate-Based)
-    # Logic: We punish the % of failures, not the raw count.
-    # We add a 'sensitivity' multiplier (e.g., 300).
-    # If 1% of goods are fake -> 0.01 * 300 = -3 points Trust (Manageable warning)
-    # If 5% of goods are fake -> 0.05 * 300 = -15 points Trust (Crisis)
     if sold_items > 0:
         fake_rate = fakes_sold / sold_items
         reputation_hit = fake_rate * 300
@@ -188,7 +177,6 @@ def run_month():
         "Raw Demand Volume": f"{demand_volume:.1f} bids",
         "Actual Sold": f"{sold_items:.1f} items",
         "New buyer traffic": f"{new_buyer_traffic:.1f} buyers",
-
         
         "--- RISKS ---": "",
         "Fake Probability": f"{fake_probability:.1%} per item",
@@ -197,36 +185,48 @@ def run_month():
     }
 
 # --- DASHBOARD UI ---
-st.title("Luxury Strategy Sim: The Trust & Inventory Game")
+st.title(f"Luxury Consignment Sim (Experiment {st.session_state.round_number})")
 
-# Create 5 columns for the new layout
-col1, col2, col3, col4, col5 = st.columns(5)
+# TIER 1: GLOBAL FUND METRICS
+st.markdown("### 🏦 VC Fund Performance")
+fc1, fc2 = st.columns(2)
 
-# 1. Cash Balance
-col1.metric("Cash Balance", f"${st.session_state.cash/1000000:.2f}M")
+fc1.metric("Total Fund Cash Remaining", f"${st.session_state.cash/1000000:.2f}M")
 
-# 2. Last Month Profit
-# We check if history exists; if not, show $0
+# Calculate how much money they have made/lost in THIS specific attempt
+round_pnl = st.session_state.cash - st.session_state.starting_cash_this_round
+fc2.metric("P&L for Current Experiment", f"${round_pnl:,.0f}")
+
+st.divider()
+
+# TIER 2: MONTHLY OPERATIONAL METRICS
+st.markdown("### 📊 Operational Dashboard (Current Month)")
+col1, col2, col3, col4 = st.columns(4)
+
+# Last Month Profit
 last_profit = st.session_state.history.iloc[-1]['Net_Profit'] if not st.session_state.history.empty else 0
-col2.metric("Last Month Profit", f"${last_profit:,.0f}")
+col1.metric("Last Month Profit", f"${last_profit:,.0f}")
 
-# 3. Inventory Level
-col3.metric("Inventory", f"{int(st.session_state.inventory):,} items")
+# Inventory Level
+#col2.metric("Inventory", f"{int(st.session_state.inventory):,} items")
+col2.metric("Inventory", f"{st.session_state.inventory:.0f} items")
 
-# 4. Items Sold (New addition)
+# Items Sold
 last_sold = st.session_state.history.iloc[-1]['Items_Sold'] if not st.session_state.history.empty else 0
-col4.metric("Items Sold", f"{int(last_sold):,} items")
+#col3.metric("Items Sold", f"{int(last_sold):,} items")
+col3.metric("Items Sold", f"{last_sold:.0f} items")
 
-# 5. Trust Score
-col5.metric("Trust Score", f"{st.session_state.reputation:.1f}/100")
+# Trust Score
+col4.metric("Trust Score", f"{st.session_state.reputation:.0f}/100")
 
+# Run Button & Game Over Logic
+st.write("") # small spacing
 if st.session_state.game_over:
-    st.error("❌ BANKRUPTCY! You ran out of cash.")
+    st.error("❌ BANKRUPTCY! The fund is out of money. Please refresh your browser to reset the entire simulation.")
 else:
     if st.button("RUN NEXT MONTH ➡️", type="primary"):
         run_month()
         st.rerun()
-
 
 # --- VISUALIZATION ---
 if not st.session_state.history.empty:
@@ -235,7 +235,6 @@ if not st.session_state.history.empty:
     # 1. Financial Health (Line Chart)
     st.subheader("Financial Performance (Net Profit)")
     c_fin = alt.Chart(st.session_state.history).mark_line(point=True).encode(
-        # Fix: axis=alt.Axis(labelAngle=0) forces labels to stay horizontal
         x=alt.X('Month:O', title='Month', axis=alt.Axis(labelAngle=0)), 
         y='Net_Profit',
         tooltip=['Month', 'Net_Profit', 'Cash']
@@ -247,7 +246,6 @@ if not st.session_state.history.empty:
     chart_data = st.session_state.history[['Month', 'Inventory_Count', 'Items_Sold', 'New_Items_Inbound']].melt('Month')
     
     c_inv = alt.Chart(chart_data).mark_bar().encode(
-        # Fix: axis=alt.Axis(labelAngle=0) added here as well
         x=alt.X('Month:O', title='Month', axis=alt.Axis(labelAngle=0)), 
         y=alt.Y('value', title='Units'),
         color=alt.Color('variable', title="Metric"),
@@ -257,13 +255,6 @@ if not st.session_state.history.empty:
     
     st.altair_chart(c_inv, use_container_width=True)
  
-
-# --- DEBUG SECTION ---
-#""" if st.session_state.debug_log:
-#    with st.expander("🛠️ Open 'Glass Box' Debugger (Variable Values)"):
-#        st.write("Below are the internal variables from the most recent calculation:")
-#        st.json(st.session_state.debug_log) """
-    
     # 3. Data Table
     st.divider()
     with st.expander("📊 View Detailed Financial Log"):
@@ -278,13 +269,5 @@ if not st.session_state.history.empty:
             "Buyer_Marketing": "${:,.0f}",
             "Seller_Marketing": "${:,.0f}",
             "Commission": "{:,.0f} %"
-
         })
         st.dataframe(styled_history, use_container_width=True)
-
-    
-# 2. Liquidity Tracking
-# st.subheader("Liquidity")
-# st.line_chart(st.session_state.history.set_index('Month')['Liquidity_Multiplier'])
-# st.caption("If Trust drops, buyers disappear. Trust drops when you cut Authentication Spend.")
-
