@@ -266,7 +266,7 @@ if not st.session_state.history.empty:
     st.divider()
 
     # 3. Data Table
-    st.divider()
+
     with st.expander("📊 View Detailed Financial Log"):
         styled_history = st.session_state.history.style.format({
             "Cash": "${:,.0f}",
