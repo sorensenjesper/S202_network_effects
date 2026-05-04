@@ -11,6 +11,8 @@ if 'round_number' not in st.session_state:
     st.session_state.round_number = 1
     st.session_state.cash = 10_000_000  # Staked with $10M total for all experiments
     st.session_state.starting_cash_this_round = 10_000_000
+    st.session_state.total_months_played = 0  # NEW: Global clock
+    st.session_state.max_months = 60          # NEW: Time limit
 
 # 2. Round-Specific State (Resets each experiment)
 if 'history' not in st.session_state:
@@ -47,7 +49,7 @@ st.sidebar.header("Strategic Decisions")
 
 # 1. Commission Strategy (The Take Rate)
 st.sidebar.subheader("Monetization")
-commission_rate = st.sidebar.slider("Platform Commission (%)", 10, 60, 40, 
+commission_rate = st.sidebar.slider("Platform Commission (%)", 10, 90, 50, 
                                     help="High commission = More revenue per item, but fewer sellers.")
 
 # 2. Authentication Protocol (The Trust Lever)
@@ -57,8 +59,8 @@ auth_spend_per_item = st.sidebar.slider("Authentication Cost per Item ($)", 10, 
 
 # 3. Marketing (Acquisition)
 st.sidebar.subheader("Monthly Marketing Budget")
-buyer_marketing = st.sidebar.number_input("Buyer Marketing ($)", 0, 200000, 20000, step=5000)
-seller_marketing = st.sidebar.number_input("Seller Marketing ($)", 0, 200000, 20000, step=5000)
+buyer_marketing = st.sidebar.number_input("Buyer Marketing ($)", 0, 200000, 10000, step=5000)
+seller_marketing = st.sidebar.number_input("Seller Marketing ($)", 0, 200000, 10000, step=5000)
 
 # --- SIDEBAR: NEW EXPERIMENT BUTTON ---
 st.sidebar.divider()
@@ -74,27 +76,35 @@ def run_month():
     reputation = st.session_state.reputation
     cash = st.session_state.cash
     
-    # --- 1. SUPPLY SIDE CALCS (THE AMPLIFIER MODEL) ---
-    
-    # A. The "Organic Engine" (Liquidity & Economics)
+# --- 1. SUPPLY SIDE CALCS (THE STABLE MODEL) ---
     if not st.session_state.history.empty:
         prev_speed = st.session_state.history.iloc[-1]['Avg_Days_to_Sell']
     else:
         prev_speed = 60
 
-    liquidity_multiplier = np.clip(2.5 - (prev_speed / 30), 0.2, 2.0)
-    payout_multiplier = max(0.1, 2.0 - (commission_rate / 40))
+    # Smooth Liquidity (30 days is optimal, 90 days is slow)
+    liquidity_multiplier = np.clip(2.5 - (prev_speed / 90), 0.2, 2.0)
+    
+    # Standard Payout (Calibrated for a trap)
+    # At 20% Comm: Multiplier is 1.3x (Boost for building)
+    # At 40% Comm: Multiplier is 0.5x (Harvest phase - speed cancels this penalty)
+    # At 50% Comm: Multiplier is 0.1x (Absolute chokehold - default trap)
+    payout_multiplier = max(0.1, 2.1 - (commission_rate / 25))
+    # Standard Payout
+    #payout_multiplier = max(0.1, 2.0 - (commission_rate / 40))
+    
+    # The Original Generous Base Flow
     base_organic_flow = 110 + (inventory * 0.05)
     
-    # B. The "Marketing Turbocharger"
+    # The Original Marketing Turbocharger
     marketing_amplifier = 1.0 + np.log1p(seller_marketing / 10000)
     
     # C. Total Inbound Calculation
     new_items_inbound = (base_organic_flow * liquidity_multiplier * payout_multiplier) * marketing_amplifier
     processing_cost = new_items_inbound * auth_spend_per_item
-    
-    # --- 2. AUTHENTICATION CALCS ---
-    # A. The Probability Curve (Quadratic)
+
+
+# --- 2. AUTHENTICATION CALCS ---
     if auth_spend_per_item < 30:
         fake_probability = ((30 - auth_spend_per_item) / 30) ** 2
     else:
@@ -110,11 +120,9 @@ def run_month():
     demand_volume = new_buyer_traffic * variety_multiplier * conversion_rate
     sold_items = min(inventory + new_items_inbound, demand_volume)
     
-    # --- 4. FEEDBACK CALCS ---
-    # B. The Actual Fakes Sold
+    # --- 4. FEEDBACK CALCS (WITH DAMPENER) ---
     fakes_sold = sold_items * fake_probability
 
-    # C. The Reputation Hit (Rate-Based)
     if sold_items > 0:
         fake_rate = fakes_sold / sold_items
         reputation_hit = fake_rate * 300
@@ -123,10 +131,14 @@ def run_month():
     
     new_reputation = max(0, min(100, reputation - reputation_hit + 0.5))
 
+    # THE DAMPENER: Smooth out the velocity so sellers don't panic instantly
     if sold_items > 0:
-        days_to_sell = (inventory / sold_items) * 30
+        current_speed = (inventory / sold_items) * 30
     else:
-        days_to_sell = 120
+        current_speed = 120
+        
+    # Blend current speed with previous speed (50/50 Trailing Average)
+    days_to_sell = (current_speed * 0.5) + (prev_speed * 0.5)
         
     final_inventory = max(0, inventory + new_items_inbound - sold_items)
     
@@ -138,8 +150,12 @@ def run_month():
     net_profit = gross_revenue - total_spend
     new_cash = cash + net_profit
     
+    # Check for Bankruptcy OR Time Out
+    st.session_state.total_months_played += 1
     if new_cash <= 0:
-        st.session_state.game_over = True
+        st.session_state.game_over = "bankrupt"
+    elif st.session_state.total_months_played >= st.session_state.max_months:
+        st.session_state.game_over = "timeout"
 
     # --- SAVE STATE ---
     st.session_state.month += 1
@@ -161,6 +177,7 @@ def run_month():
         'Net_Profit': net_profit
     }
     st.session_state.history.loc[len(st.session_state.history)] = new_row
+
 
     # --- CAPTURE DEBUG DATA ---
     st.session_state.debug_log = {
@@ -220,18 +237,52 @@ col3.metric("Items Sold", f"{last_sold:.0f} items")
 col4.metric("Trust Score", f"{st.session_state.reputation:.0f}/100")
 
 # Run Button & Game Over Logic
-st.write("") # small spacing
-if st.session_state.game_over:
-    st.error("❌ BANKRUPTCY! The fund is out of money. Please refresh your browser to reset the entire simulation.")
+st.write("") 
+
+# Show the clock
+st.progress(st.session_state.total_months_played / st.session_state.max_months, 
+            text=f"Fund Time Remaining: {st.session_state.max_months - st.session_state.total_months_played} months")
+
+if st.session_state.game_over == "bankrupt":
+    st.error("❌ BANKRUPTCY! The fund is out of money.")
+elif st.session_state.game_over == "timeout":
+    st.success(f"🏁 TIME'S UP! The VC Fund has closed. Your Final Score (Remaining Cash): ${st.session_state.cash/1000000:.2f}M")
 else:
     if st.button("RUN NEXT MONTH ➡️", type="primary"):
         run_month()
         st.rerun()
 
+# # Run Button & Game Over Logic
+# st.write("") # small spacing
+# if st.session_state.game_over:
+#     st.error("❌ BANKRUPTCY! The fund is out of money. Please refresh your browser to reset the entire simulation.")
+# else:
+#     if st.button("RUN NEXT MONTH ➡️", type="primary"):
+#         run_month()
+#         st.rerun()
+
 # --- VISUALIZATION ---
 if not st.session_state.history.empty:
     st.divider()
 
+    # 3. Data Table
+    st.divider()
+    with st.expander("📊 View Detailed Financial Log"):
+        styled_history = st.session_state.history.style.format({
+            "Cash": "${:,.0f}",
+            "Net_Profit": "${:,.0f}",
+            "Reputation_Score": "{:.1f}",
+            "Avg_Days_to_Sell": "{:.1f} days",
+            "Inventory_Count": "{:,.0f}",
+            "Items_Sold": "{:,.0f}",
+            "New_Items_Inbound": "{:,.0f}",
+            "Buyer_Marketing": "${:,.0f}",
+            "Seller_Marketing": "${:,.0f}",
+            "Commission": "{:,.0f} %"
+        })
+        st.dataframe(styled_history, use_container_width=True)
+
+        
     # 1. Financial Health (Line Chart)
     st.subheader("Financial Performance (Net Profit)")
     c_fin = alt.Chart(st.session_state.history).mark_line(point=True).encode(
@@ -255,19 +306,3 @@ if not st.session_state.history.empty:
     
     st.altair_chart(c_inv, use_container_width=True)
  
-    # 3. Data Table
-    st.divider()
-    with st.expander("📊 View Detailed Financial Log"):
-        styled_history = st.session_state.history.style.format({
-            "Cash": "${:,.0f}",
-            "Net_Profit": "${:,.0f}",
-            "Reputation_Score": "{:.1f}",
-            "Avg_Days_to_Sell": "{:.1f} days",
-            "Inventory_Count": "{:,.0f}",
-            "Items_Sold": "{:,.0f}",
-            "New_Items_Inbound": "{:,.0f}",
-            "Buyer_Marketing": "${:,.0f}",
-            "Seller_Marketing": "${:,.0f}",
-            "Commission": "{:,.0f} %"
-        })
-        st.dataframe(styled_history, use_container_width=True)
